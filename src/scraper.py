@@ -1,13 +1,15 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+import asyncio
 from dataclasses import dataclass
 from typing import List, Dict
-import requests
+
+import aiohttp
 from bs4 import BeautifulSoup
-import json
 
 
 @dataclass
 class SiteConfig:
+    """Mock Site class mimicking database Object"""
     base_url: str
     extension: str
     link_selector: str
@@ -17,24 +19,46 @@ class SiteConfig:
 
 @dataclass
 class PageTask:
+    """Task class for interconnecting scraping pipeline components"""
     site: SiteConfig
     url: str
     html: bytes = b""
 
+    async def assign_html(self, session: aiohttp.ClientSession):
+        self.html = await fetch_html(session, self.url)
 
-def fetch_html(url: str) -> bytes:
+
+async def fetch_html(session: aiohttp.ClientSession, url: str) -> bytes:
+    """Function which fetches html from web"""
     print(f"Fetching: {url}")
-    res = requests.get(url, timeout=15)
-    res.raise_for_status()
-    print(f"Finished fetching: {url}")
-    return res.content
+    async with session.get(url) as response:
+        response.raise_for_status()
+        return await response.content.read()
+
+
+async def assign_html_to_tasks(tasks: List[PageTask]):
+    """Function which dynamicaly assigns html to tasks"""
+    async with aiohttp.ClientSession() as session:
+        coros = [task.assign_html(session) for task in tasks]
+        await asyncio.gather(*coros)
 
 
 def extract_links(html: bytes, link_selector: str, base_url: str) -> List[str]:
+    """Function which extracts links from html"""
     print("Extracting links...")
     soup = BeautifulSoup(html, "html.parser")
     tags = soup.select(link_selector)
     return [base_url + str(tag.get("href")) for tag in tags]
+
+
+def generate_post_tasks(tasks: List[PageTask]):
+    """Function which generates child tasks based on links"""
+    post_tasks: List[PageTask] = []
+    for task in tasks:
+        links = extract_links(task.html, task.site.link_selector, task.site.base_url)
+        for link in links:
+            post_tasks.append(PageTask(task.site, link))
+    return post_tasks
 
 
 def parse_post_html(
@@ -43,12 +67,14 @@ def parse_post_html(
     body_selector: str,
     url: str
 ) -> Dict[str, str]:
+    """Function for parsing a post"""
     print("Parsing post...")
     soup = BeautifulSoup(html, "html.parser")
 
     title_tag = soup.select_one(title_selector)
     if not title_tag:
         raise ValueError("Failed to extract title - CSS selector likely wrong")
+        # Probably send email
 
     body_parts = [p.get_text(strip=True) for p in soup.select(body_selector)]
 
@@ -59,51 +85,10 @@ def parse_post_html(
     }
 
 
-def main():
-    SITE_COUNT = 1
-
-    site_list = [
-        SiteConfig(
-            base_url="https://formulanews.ge",
-            extension="/Category/all",
-            link_selector="div.main__new__slider__desc > a",
-            title_selector="h1.news__inner__desc__title",
-            body_selector="section.article-content > p"
-        )
-        for _ in range(SITE_COUNT)
-    ]
-
-    list_page_tasks: List[PageTask] = [
-        PageTask(site=s, url=s.base_url + s.extension)
-        for s in site_list
-    ]
-
-    del site_list
-
-    with ThreadPoolExecutor(max_workers=50) as pool:
-        future_to_task = {pool.submit(fetch_html, t.url): t for t in list_page_tasks}
-        for future in as_completed(future_to_task):
-            task = future_to_task[future]
-            task.html = future.result()
-
-    post_tasks: List[PageTask] = []
-
-    for task in list_page_tasks:
-        links = extract_links(task.html, task.site.link_selector, task.site.base_url)
-        for link in links:
-            post_tasks.append(PageTask(task.site, link))
-
-    del list_page_tasks
-
-    with ThreadPoolExecutor(max_workers=50) as pool:
-        future_to_task = {pool.submit(fetch_html, t.url): t for t in post_tasks}
-        for future in as_completed(future_to_task):
-            task = future_to_task[future]
-            task.html = future.result()
-
+def parse_all_posts(tasks: List[PageTask]):
+    """Function for parsing multiple posts based on task list"""
     parsed_posts: List[Dict] = []
-
-    for task in post_tasks:
+    for task in tasks:
         post = parse_post_html(
             task.html,
             task.site.title_selector,
@@ -111,6 +96,44 @@ def main():
             task.url
         )
         parsed_posts.append(post)
+    return parsed_posts
+
+
+def list_all_sites(site_count: int):
+    """Mock function mimicking database call"""
+    return [
+        SiteConfig(
+            base_url="https://formulanews.ge",
+            extension="/Category/all",
+            link_selector="div.main__new__slider__desc > a",
+            title_selector="h1.news__inner__desc__title",
+            body_selector="section.article-content > p"
+        )
+        for _ in range(site_count)
+    ]
+
+
+async def main():
+    SITE_COUNT = 1
+
+    site_list = list_all_sites(SITE_COUNT)
+
+    list_page_tasks: List[PageTask] = [
+        PageTask(site=site, url=site.base_url + site.extension)
+        for site in site_list
+    ]
+
+    del site_list
+
+    await assign_html_to_tasks(list_page_tasks)
+
+    post_tasks = generate_post_tasks(list_page_tasks)
+
+    del list_page_tasks
+
+    await assign_html_to_tasks(post_tasks)
+
+    parsed_posts = parse_all_posts(post_tasks)
 
     del post_tasks
 
@@ -121,4 +144,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
